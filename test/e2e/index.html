@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>BlindReplay test page</title>
+  <script src="charting_library_v31.2.0/charting_library.standalone.js"></script>
+  <script src="dhan/dist/fake-feed.js"></script>
+  <style>html,body{margin:0;height:100%;background:#000}#tv_chart_container{position:fixed;inset:0}</style>
+</head>
+<body>
+  <div id="tv_chart_container"></div>
+  <script>
+    window.addEventListener('DOMContentLoaded', function () {
+      window.dhan_tvWidget = new TradingView.widget({
+        fullscreen: true,
+        symbol: 'NSE:TEST',
+        interval: '1',
+        container: 'tv_chart_container',
+        datafeed: new FakeFeed(),
+        library_path: 'charting_library_v31.2.0/',
+        locale: 'en',
+        timezone: 'Asia/Kolkata',
+        theme: 'dark',
+        disabled_features: ['use_localstorage_for_settings', 'header_saveload'],
+        enabled_features: [],
+        widgetbar: { details: true, watchlist: true, datawindow: true, watchlist_settings: { default_symbols: ['NSE:TEST', 'NSE:OTHER'] } },
+      });
+    });
+  </script>
+</body>
+</html>

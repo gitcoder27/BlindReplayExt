@@ -1,0 +1,51 @@
+{
+  "manifest_version": 3,
+  "name": "BlindReplay",
+  "version": "1.0.0",
+  "description": "Manual candle-by-candle replay for Dhan's TradingView charts (tv.dhan.co). Hides future candles so you can backtest blind.",
+  "minimum_chrome_version": "111",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_title": "BlindReplay: show/hide the panel on tv.dhan.co",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png"
+    }
+  },
+  "permissions": [
+    "storage"
+  ],
+  "background": {
+    "service_worker": "src/background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://tv.dhan.co/*",
+        "https://tradingview.dhan.co/*"
+      ],
+      "js": [
+        "src/engine.js",
+        "src/page.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": false
+    },
+    {
+      "matches": [
+        "https://tv.dhan.co/*",
+        "https://tradingview.dhan.co/*"
+      ],
+      "js": [
+        "src/bridge.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": false
+    }
+  ]
+}

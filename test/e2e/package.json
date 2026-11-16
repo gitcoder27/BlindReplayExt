@@ -1,0 +1,8 @@
+{
+  "name": "blindreplay-e2e",
+  "private": true,
+  "type": "module",
+  "description": "End-to-end test for the BlindReplay extension (not part of the extension).",
+  "scripts": { "test": "node e2e.mjs" },
+  "dependencies": { "playwright": "^1.65.1" }
+}
