@@ -1,5 +1,5 @@
 /*
- * BlindReplay page script. Runs in the page's MAIN world on tv.dhan.co.
+ * BlindReplay page script. Runs in the page's MAIN world on tv.dhan.co and scalper.dhan.co.
  *
  * How hiding works
  *   Dhan's page builds the TradingView library widget as window.dhan_tvWidget
@@ -43,6 +43,7 @@
     start: '',
     panel: { x: null, y: null, collapsed: false, hidden: false },
   };
+  const ALT = /Mac|iPhone|iPad/i.test((navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || '') ? 'Option' : 'Alt';
   const SPEEDS = [0.5, 1, 2, 3, 5, 8, 12, 20]; // candles per second
 
   const settings = JSON.parse(JSON.stringify(DEFAULTS));
@@ -292,10 +293,99 @@
     R.trapInstalled = false;
   }
 
+  // Pages that keep the widget private (scalper.dhan.co bundles the library and
+  // stores the widget inside its own code). The library always registers its
+  // options as window[<iframe id>] and inserts <iframe id="tradingview_…">
+  // synchronously, before any chart code loads, so finding that iframe gives
+  // us the datafeed in time to gate the first request. A small stand-in object
+  // provides the few widget calls BlindReplay uses, through the library's API.
+  function widgetFromIframe(iframe) {
+    if (!iframe || iframe.tagName !== 'IFRAME' || !/^tradingview_/.test(iframe.id || '')) return null;
+    if (R.widget && R.widget._iFrame === iframe) return null;
+    const real = safe(() => window.dhan_tvWidget, null);
+    if (real && real._iFrame === iframe) return null;
+    const cfg = safe(() => window[iframe.id], null);
+    if (!cfg || typeof cfg !== 'object' || !cfg.datafeed || typeof cfg.datafeed.getBars !== 'function') return null;
+    const api = () => iframe.contentWindow.tradingViewApi;
+    let readyFired = false;
+    const f = {
+      _iFrame: iframe,
+      _options: { datafeed: cfg.datafeed },
+      _standIn: true,
+      get _ready() {
+        return readyFired;
+      },
+      chart: (i) => api().chart(i),
+      activeChart: () => api().activeChart(),
+      chartsCount: () => api().chartsCount(),
+      setActiveChart: (i) => api().setActiveChart(i),
+      resetCache: () => api().resetCache(),
+      onChartReady(cb) {
+        // The library's own ready event, subscribed to alongside the app's.
+        let subscribed = false;
+        const once = () => {
+          if (readyFired) return;
+          readyFired = true;
+          cb();
+        };
+        const tick = () => {
+          if (R.tornDown || R.widget !== f || readyFired || !iframe.isConnected) return;
+          const cw = safe(() => iframe.contentWindow, null);
+          if (!subscribed && cw && typeof cw.widgetReady === 'function') {
+            subscribed = true;
+            safe(() => cw.widgetReady(once));
+          }
+          // Missed the event (attached late): ready once the API has charts.
+          if (subscribed && safe(() => api().chartsCount() > 0 && !!api().activeChart().getTimeScale(), false)) {
+            setTimeout(() => {
+              if (R.widget === f) once();
+            }, 1500);
+          }
+          setTimeout(tick, 250);
+        };
+        tick();
+      },
+    };
+    return f;
+  }
+
+  function scanForIframes(nodes) {
+    if (R.tornDown) return;
+    for (const n of nodes) {
+      if (!n || n.nodeType !== 1) continue;
+      const list = n.tagName === 'IFRAME' ? [n] : n.getElementsByTagName ? n.getElementsByTagName('iframe') : [];
+      for (const fr of list) {
+        const w = widgetFromIframe(fr);
+        if (w) onWidget(w);
+      }
+    }
+  }
+
+  let iframeObserver = null;
+
+  function installIframeWatch() {
+    try {
+      iframeObserver = new MutationObserver((records) => {
+        for (const rec of records) if (rec.addedNodes.length) scanForIframes(rec.addedNodes);
+      });
+      iframeObserver.observe(document, { childList: true, subtree: true });
+    } catch (_) {
+      /* polling below still finds it */
+    }
+  }
+
   function onWidget(w) {
     if (!w || typeof w !== 'object' || R.tornDown) return;
     if (w === R.widget) {
       patchDatafeed(w._options && w._options.datafeed);
+      return;
+    }
+    // The page published the real widget for an iframe we already attached to
+    // through the stand-in: switch over without resetting anything.
+    if (R.widget && R.widget._standIn && !w._standIn && w._iFrame && w._iFrame === R.widget._iFrame) {
+      R.widget = w;
+      patchDatafeed(w._options && w._options.datafeed);
+      if (!R.ready) watchReady(w);
       return;
     }
     if (R.widget && R.active) hardStop();
@@ -304,9 +394,13 @@
     R.chartStates.clear();
     patchDatafeed(w._options && w._options.datafeed);
     maybeEarlyStart();
+    watchReady(w);
+  }
+
+  function watchReady(w) {
     try {
       w.onChartReady(() => {
-        if (R.widget !== w) return;
+        if (R.widget !== w || R.ready) return;
         R.ready = true;
         hookWindows();
         UI.mount();
@@ -336,7 +430,7 @@
     engine.clearData();
     R.active = true;
     settings.start = toISTInput(t);
-    R.message = 'Started blind on page load. Shift+→ reveals the next candle.';
+    R.message = `Started blind on page load. ${ALT}+→ reveals the next candle.`;
     R.messageKind = 'ok';
   }
 
@@ -360,6 +454,14 @@
     if (R.tornDown) return;
     const w = window.dhan_tvWidget;
     if (w && (w !== R.widget || !(R.datafeed && R.datafeed[PATCHED]))) onWidget(w);
+    if (R.widget && R.widget._standIn && !R.widget._iFrame.isConnected) {
+      // The page removed its chart (for example on navigation inside the app).
+      R.ready = false;
+      if (R.active) hardStop();
+      R.widget = null;
+      R.chartStates.clear();
+    }
+    if (!w) scanForIframes(document.querySelectorAll('iframe[id^="tradingview_"]'));
     if (R.ready) {
       hookWindows();
       if (!R.widget._ready && safe(() => R.widget.chartsCount(), 0) === 0) R.ready = false;
@@ -423,9 +525,23 @@
     };
 
     w.getBars = function (symbolInfo, resolution, periodParams, onResult, onError) {
-      if (!R.active || callerIsDhanApp()) {
-        if (!R.active) R.servedLive = true;
-        return orig.getBars.apply(this, arguments);
+      if (callerIsDhanApp()) return orig.getBars.apply(this, arguments);
+      if (!R.active) {
+        R.servedLive = true;
+        // A live request still in flight when a replay starts must not slip
+        // through: trim its answer to the replay point.
+        const args = Array.prototype.slice.call(arguments);
+        const cb = args[3];
+        if (typeof cb === 'function') {
+          args[3] = function (bars, meta) {
+            if (R.active && Array.isArray(bars)) {
+              const clock = engine.clock;
+              bars = clock == null ? [] : bars.filter((b) => b && b.time < clock);
+            }
+            return cb.call(this, bars, meta);
+          };
+        }
+        return orig.getBars.apply(this, args);
       }
       const S = engine.seriesFor(symbolInfo, resolution);
       S.rawResolution = resolution;
@@ -959,6 +1075,7 @@
     if (!R.active) {
       captureViews();
       R.active = true;
+      R.outsideRevealed = false;
     }
     for (const c of chartsList()) {
       const st = chartState(c);
@@ -971,7 +1088,7 @@
     reloadAll();
     scheduleQuotes();
     ensureLoop();
-    setMessage('Replay started. Shift+→ reveals the next candle.', 'ok');
+    setMessage(`Replay started. ${ALT}+→ reveals the next candle.`, 'ok');
   }
 
   function stopReplay() {
@@ -1184,10 +1301,16 @@
     if (R.tornDown) return;
     if (!R.active && !R.picking) {
       for (const st of R.chartStates.values()) if (st.cover) st.cover.style.display = 'none';
+      renderOutsideMask();
       return;
     }
     try {
       renderCovers();
+    } catch (e) {
+      /* keep going */
+    }
+    try {
+      renderOutsideMask();
     } catch (e) {
       /* keep going */
     }
@@ -1302,6 +1425,9 @@ html.blindreplay-mask .layout__area--tradingpanel::after{
 .blindreplay-modal-mask{position:absolute;inset:0;z-index:2147483000;background:#000;color:#bbb;display:flex;
   flex-direction:column;gap:10px;align-items:center;justify-content:center;text-align:center;
   font:13px/1.4 system-ui,sans-serif;border-radius:inherit;padding:16px}
+.blindreplay-outside{position:fixed;z-index:2147482000;display:none;background:#000;color:#8a8a8a;flex-direction:column;
+  gap:10px;align-items:center;justify-content:center;text-align:center;font:13px/1.4 system-ui,sans-serif;padding:12px;overflow:hidden}
+.blindreplay-outside button,
 .blindreplay-modal-mask button{font:inherit;color:#111;background:#f5a524;border:0;border-radius:6px;padding:6px 12px;cursor:pointer}`;
 
   const MODAL_ALLOW = new Set([
@@ -1352,6 +1478,76 @@ html.blindreplay-mask .layout__area--tradingpanel::after{
       for (const m of document.querySelectorAll('.blindreplay-modal-mask')) m.remove();
       for (const m of document.querySelectorAll('[data-blindreplay-revealed]')) delete m.dataset.blindreplayRevealed;
     }
+  }
+
+  // Live prices on the page around the chart (scalper.dhan.co's option chain,
+  // positions and spot price). Four strips cover everything outside the chart
+  // frame. On tv.dhan.co the chart fills the window, so they cover nothing.
+  const OUT = { els: null, key: '' };
+
+  function hideOutsideMask() {
+    if (!OUT.els) return;
+    for (const el of OUT.els) el.style.display = 'none';
+    OUT.key = '';
+  }
+
+  function renderOutsideMask() {
+    const fr = R.widget && R.widget._iFrame;
+    const on = (R.active || R.picking) && settings.mask && !R.outsideRevealed && fr && fr.isConnected;
+    let r = on ? fr.getBoundingClientRect() : null;
+    if (r && (r.width < 50 || r.height < 50)) r = null; // chart not on screen
+    if (!r || !document.documentElement) return hideOutsideMask();
+    const W = window.innerWidth;
+    const H = window.innerHeight;
+    const L = clamp(Math.floor(r.left), 0, W);
+    const T = clamp(Math.floor(r.top), 0, H);
+    const Rt = clamp(Math.ceil(r.right), 0, W);
+    const B = clamp(Math.ceil(r.bottom), 0, H);
+    const rects = [
+      [0, 0, W, T],
+      [0, B, W, H - B],
+      [0, T, L, B - T],
+      [Rt, T, W - Rt, B - T],
+    ];
+    const key = rects.join(';');
+    if (key === OUT.key && OUT.els && OUT.els[0].isConnected) return;
+    OUT.key = key;
+    if (!OUT.els || !OUT.els[0].isConnected) {
+      OUT.els = rects.map(() => {
+        const el = document.createElement('div');
+        el.className = 'blindreplay-outside';
+        document.documentElement.appendChild(el);
+        return el;
+      });
+    }
+    let biggest = -1;
+    let area = 0;
+    rects.forEach(([, , w, h], i) => {
+      if (w >= 160 && h >= 60 && w * h > area) {
+        area = w * h;
+        biggest = i;
+      }
+    });
+    rects.forEach(([x, y, w, h], i) => {
+      const el = OUT.els[i];
+      if (w < 2 || h < 2) {
+        el.style.display = 'none';
+        return;
+      }
+      el.style.cssText = `display:flex;left:${x}px;top:${y}px;width:${w}px;height:${h}px`;
+      if (i === biggest) {
+        if (!el.firstChild) {
+          el.innerHTML = '<div>Live prices around the chart are hidden while BlindReplay is running.</div><button type="button">Show it anyway</button>';
+          el.querySelector('button').addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            R.outsideRevealed = true;
+            hideOutsideMask();
+          });
+        }
+      } else if (el.firstChild) {
+        el.textContent = '';
+      }
+    });
   }
 
   function scanModals() {
@@ -1414,7 +1610,12 @@ html.blindreplay-mask .layout__area--tradingpanel::after{
       endPick();
       return;
     }
-    if (!R.active || !e.shiftKey || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (!R.active || e.ctrlKey || e.metaKey) return;
+    // Stepping uses Option/Alt + arrows. Shift + arrows are never touched: on
+    // scalper.dhan.co they are Dhan's order hotkeys (buy / sell).
+    const arrows = e.altKey && !e.shiftKey;
+    const shiftOnly = e.shiftKey && !e.altKey;
+    if (!(arrows && e.code.startsWith('Arrow')) && !(shiftOnly && (e.code === 'Space' || e.code === 'KeyR'))) return;
     switch (e.code) {
       case 'ArrowRight':
         consume();
@@ -1488,7 +1689,8 @@ html.blindreplay-mask .layout__area--tradingpanel::after{
 :host{all:initial}
 *{box-sizing:border-box}
 .wrap{position:fixed;z-index:2147483600;font:12px/1.35 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:#d8d8d8;
-  background:#121315;border:1px solid #2a2c31;border-radius:10px;box-shadow:0 8px 28px rgba(0,0,0,.45);width:276px;user-select:none}
+  background:#121315;border:1px solid #2a2c31;border-radius:10px;box-shadow:0 8px 28px rgba(0,0,0,.45);user-select:none;
+  width:max-content;min-width:276px;max-width:min(420px,calc(100vw - 8px))}
 .wrap.hidden{display:none}
 .head{display:flex;align-items:center;gap:8px;padding:7px 8px 7px 10px;cursor:grab;border-bottom:1px solid #222429}
 .head:active{cursor:grabbing}
@@ -1498,20 +1700,26 @@ html.blindreplay-mask .layout__area--tradingpanel::after{
 .clock{margin-left:auto;font-variant-numeric:tabular-nums;color:#c9c9c9;white-space:nowrap}
 .iconbtn{background:none;border:0;color:#9a9a9a;cursor:pointer;padding:2px 4px;border-radius:4px;font:inherit;line-height:1}
 .iconbtn:hover{color:#fff;background:#24262b}
-.body{padding:10px;display:grid;gap:9px}
+.body{padding:10px;display:grid;grid-template-columns:minmax(0,1fr);gap:9px}
+/* Sized by the controls; long text wraps instead of widening the panel. */
+.status,.msg,.keys{contain:inline-size;overflow-wrap:anywhere}
+.row>*{flex-shrink:0}
+.row>input[type=datetime-local],.row>input[type=range]{flex-shrink:1}
+.row.date{flex-wrap:wrap}
+.row.date input{flex:1 1 150px}
 .wrap.collapsed .body{display:none}
 .wrap.collapsed{width:auto;min-width:180px}
 .wrap.collapsed .head{border-bottom:0}
 .row{display:flex;align-items:center;gap:6px}
 .row.split{justify-content:space-between}
 label{color:#a5a5a5}
-.switch{display:flex;align-items:center;gap:8px;cursor:pointer;color:#eee;font-weight:500}
+.switch{display:flex;align-items:center;gap:8px;cursor:pointer;color:#eee;font-weight:500;white-space:nowrap}
 .switch input{appearance:none;width:30px;height:17px;border-radius:9px;background:#3a3c42;position:relative;margin:0;cursor:pointer;transition:background .15s}
 .switch input::after{content:"";position:absolute;top:2px;left:2px;width:13px;height:13px;border-radius:50%;background:#ddd;transition:transform .15s}
 .switch input:checked{background:#f5a524}
 .switch input:checked::after{transform:translateX(13px);background:#111}
 .seg{display:inline-flex;border:1px solid #2f3137;border-radius:6px;overflow:hidden}
-.seg button{background:#191a1d;color:#aaa;border:0;padding:4px 8px;font:inherit;cursor:pointer}
+.seg button{background:#191a1d;color:#aaa;border:0;padding:4px 8px;font:inherit;cursor:pointer;white-space:nowrap}
 .seg button.sel{background:#2d2f35;color:#fff}
 input[type=datetime-local],input[type=number]{background:#1b1c20;color:#eee;border:1px solid #2f3137;border-radius:6px;padding:4px 6px;font:inherit;
   font-variant-numeric:tabular-nums;color-scheme:dark;min-width:0}
@@ -1537,7 +1745,7 @@ input[type=range]{flex:1;accent-color:#f5a524;min-width:0}
   border-top:1px solid #1f2125;padding-top:8px}
 .keys span:nth-child(odd){white-space:nowrap}
 .keys kbd{font:inherit;color:#a0a0a0;background:#1c1d21;border:1px solid #2a2c31;border-radius:3px;padding:0 3px}
-.check{display:flex;align-items:center;gap:6px;cursor:pointer;color:#bdbdbd}
+.check{display:flex;align-items:center;gap:6px;cursor:pointer;color:#bdbdbd;white-space:nowrap}
 .check input{accent-color:#f5a524;margin:0}
 `;
 
@@ -1555,25 +1763,25 @@ input[type=range]{flex:1;accent-color:#f5a524;min-width:0}
         <button data-mode="sync">Synced</button><button data-mode="independent">Independent</button>
       </div>
     </div>
-    <div class="row">
+    <div class="row date">
       <input type="datetime-local" data-start title="Replay start, IST. The candle at this time is the first hidden one.">
       <button class="btn primary" data-act="go" title="Start the replay at this time">Start</button>
       <button class="btn" data-act="pick" title="Click a candle on the chart to start from it">Pick</button>
     </div>
     <div class="transport">
       <button class="btn" data-act="reset" title="Back to start (Shift+R)">⟲</button>
-      <button class="btn" data-act="jback" title="Back N candles (Shift+↓)">«</button>
-      <button class="btn" data-act="back" title="Back one candle (Shift+←)">‹</button>
+      <button class="btn" data-act="jback" title="Back N candles (${ALT}+↓)">«</button>
+      <button class="btn" data-act="back" title="Back one candle (${ALT}+←)">‹</button>
       <button class="btn" data-act="play" title="Play / pause (Shift+Space)">▶</button>
-      <button class="btn" data-act="fwd" title="Next candle (Shift+→)">›</button>
-      <button class="btn" data-act="jfwd" title="Forward N candles (Shift+↑)">»</button>
+      <button class="btn" data-act="fwd" title="Next candle (${ALT}+→)">›</button>
+      <button class="btn" data-act="jfwd" title="Forward N candles (${ALT}+↑)">»</button>
     </div>
     <div class="row">
-      <label style="width:44px">Speed</label><input type="range" min="0" max="${SPEEDS.length - 1}" step="1" data-speed>
+      <label style="min-width:46px">Speed</label><input type="range" min="0" max="${SPEEDS.length - 1}" step="1" data-speed>
       <span class="val" data-speedval></span>
     </div>
     <div class="row">
-      <label style="width:44px">Anchor</label><input type="range" min="50" max="95" step="1" data-anchor>
+      <label style="min-width:46px">Anchor</label><input type="range" min="50" max="95" step="1" data-anchor>
       <span class="val" data-anchorval></span>
     </div>
     <div class="row split">
@@ -1581,15 +1789,15 @@ input[type=range]{flex:1;accent-color:#f5a524;min-width:0}
       <span class="row"><label>Jump</label><input type="number" min="2" max="500" data-jump></span>
     </div>
     <label class="check" title="Covers the watchlist/details panel, account manager, order panel and Dhan pop-ups that show live prices"><input type="checkbox" data-mask> Hide live-price panels</label>
-    <label class="check" title="Next time tv.dhan.co loads, start the replay before any candle is drawn (latest session, at the start time used last). Leave off on days you trade live."><input type="checkbox" data-autostart> Start blind when the page loads</label>
+    <label class="check" title="Next time this site loads (set separately for each Dhan site), start the replay before any candle is drawn (latest session, at the start time used last). Leave off on days you trade live."><input type="checkbox" data-autostart> Start blind when the page loads</label>
     <div class="status" data-status></div>
     <div class="msg" data-msg></div>
     <div class="keys">
-      <span><kbd>Shift</kbd> <kbd>→</kbd> <kbd>←</kbd></span><span>next / previous candle</span>
-      <span><kbd>Shift</kbd> <kbd>↑</kbd> <kbd>↓</kbd></span><span>jump forward / back</span>
+      <span><kbd>${ALT}</kbd> <kbd>→</kbd> <kbd>←</kbd></span><span>next / previous candle</span>
+      <span><kbd>${ALT}</kbd> <kbd>↑</kbd> <kbd>↓</kbd></span><span>jump forward / back</span>
       <span><kbd>Shift</kbd> <kbd>Space</kbd></span><span>play / pause</span>
       <span><kbd>Shift</kbd> <kbd>R</kbd></span><span>back to start</span>
-      <span><kbd>Alt</kbd> <kbd>Shift</kbd> <kbd>B</kbd></span><span>show / hide this panel</span>
+      <span><kbd>${ALT}</kbd> <kbd>Shift</kbd> <kbd>B</kbd></span><span>show / hide this panel</span>
     </div>
   </div>
 </div>`;
@@ -1610,6 +1818,10 @@ input[type=range]{flex:1;accent-color:#f5a524;min-width:0}
       host.id = 'blindreplay-panel-host';
       const root = host.attachShadow({ mode: 'closed' });
       root.innerHTML = `<style>${PANEL_CSS}</style>${PANEL_HTML}`;
+      // Keys typed in the panel stay in the panel. The page only sees the
+      // shadow host as the target, so its own "ignore keys typed in a field"
+      // checks can't apply (on Scalper, Shift + arrows would place an order).
+      for (const type of ['keydown', 'keyup', 'keypress']) root.addEventListener(type, (e) => e.stopPropagation());
       document.documentElement.appendChild(host);
       this.host = host;
       this.root = root;
@@ -1858,6 +2070,7 @@ input[type=range]{flex:1;accent-color:#f5a524;min-width:0}
     unhookCharts();
     if (R.datafeed) unpatchDatafeed(R.datafeed);
     removeTrap();
+    if (iframeObserver) iframeObserver.disconnect();
     unhookWindow(window);
     unhookWindow(safe(() => iframeDoc().defaultView, null));
     const doc = iframeDoc();
@@ -1867,6 +2080,8 @@ input[type=range]{flex:1;accent-color:#f5a524;min-width:0}
     }
     if (modalObserver) modalObserver.disconnect();
     for (const m of document.querySelectorAll('.blindreplay-modal-mask')) m.remove();
+    if (OUT.els) for (const el of OUT.els) el.remove();
+    OUT.els = null;
     safe(() => document.getElementById('blindreplay-page-style').remove());
     UI.unmount();
     document.removeEventListener('blindreplay:to-page', onFromExt);
@@ -1877,6 +2092,7 @@ input[type=range]{flex:1;accent-color:#f5a524;min-width:0}
   // ---------------------------------------------------------------------------
 
   installTrap();
+  installIframeWatch();
   toExt({ type: 'hello' });
   // Test hook (no effect in normal use): lets automated tests read state.
   Object.defineProperty(window, '__blindReplayDebug', {
@@ -1889,6 +2105,22 @@ input[type=range]{flex:1;accent-color:#f5a524;min-width:0}
       pick: () => beginPick(),
       setMode: (m) => setMode(m),
       status: () => replayStatus(),
+      focusPanelField: () => UI.mounted && UI.els.jump.focus(),
+      // Panel layout check. Optionally widens the date field first, the way
+      // macOS fonts do, to test that the panel grows instead of overflowing.
+      panelLayout: (dateMinWidth) => {
+        if (!UI.mounted) return null;
+        if (dateMinWidth) UI.els.start.style.minWidth = dateMinWidth + 'px';
+        const wrap = UI.els.wrap;
+        const wr = wrap.getBoundingClientRect();
+        let maxRight = 0;
+        for (const el of wrap.querySelectorAll('*')) {
+          const r = el.getBoundingClientRect();
+          if (r.width) maxRight = Math.max(maxRight, r.right);
+        }
+        const body = wrap.querySelector('.body');
+        return { wrapLeft: wr.left, wrapRight: wr.right, width: wr.width, maxChildRight: maxRight, bodyScroll: body.scrollWidth, bodyClient: body.clientWidth };
+      },
     }),
   });
 })();

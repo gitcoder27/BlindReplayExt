@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>BlindReplay test page (scalper-style)</title>
+  <!-- Like scalper.dhan.co: library v30 under /charting_library/, app code in /chunk-*.js,
+       chart not fullscreen, live prices around it, and the widget kept out of window.dhan_tvWidget. -->
+  <script src="/charting_library/charting_library.standalone.js"></script>
+  <script src="/chunk-FAKEFEED.js"></script>
+  <style>
+    html,body{margin:0;height:100%;background:#111;color:#ddd;font:14px system-ui,sans-serif}
+    #hdr{position:fixed;left:0;right:0;top:0;height:40px;display:flex;align-items:center;gap:20px;padding:0 12px;background:#1a1a1a}
+    #side{position:fixed;right:0;top:40px;bottom:0;width:300px;background:#161616;padding:12px;box-sizing:border-box}
+    #tv_chart_container{position:fixed;left:0;top:40px;right:300px;bottom:0}
+  </style>
+</head>
+<body>
+  <div id="hdr">NIFTY <b class="live">99999</b> <button id="buy">Buy</button></div>
+  <div id="side">Option chain<br>CE LTP <b class="live">99999</b><br>Positions P&amp;L <b class="live">99999</b></div>
+  <div id="tv_chart_container"></div>
+  <script>
+    window.__orderKeys = 0;
+    // Scalper's order hotkeys: Shift + arrows on the page (and forwarded from the chart).
+    document.addEventListener('keydown', (e) => {
+      const tag = e.target && e.target.tagName; // Scalper's own "typing in a field" guard
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      if (e.shiftKey && /^Arrow/.test(e.key)) window.__orderKeys++;
+    });
+    window.addEventListener('DOMContentLoaded', function () {
+      const w = new TradingView.widget({
+        symbol: 'NSE:TEST',
+        interval: '1',
+        container: 'tv_chart_container',
+        datafeed: new FakeFeed(),
+        library_path: '/charting_library/',
+        locale: 'en',
+        timezone: 'Asia/Kolkata',
+        theme: 'dark',
+        fullscreen: false,
+        autosize: true,
+        disabled_features: ["open_account_manager","watchlist_import_export","request_only_visible_range_on_reset","trading_notifications","show_trading_notifications_history","watchlist_sections","trading_account_manager","show_object_tree","header_screenshot","header_quick_search","header_fullscreen_button","legend_inplace_edit","symbol_search_hot_key","buy_sell_buttons","header_compare","header_symbol_search","timeframes_toolbar","timezone_menu","object_tree_legend_mode","show_right_widgets_panel_by_default","add_to_watchlist","watchlist_context_menu ","popup_hints","header_saveload"],
+        enabled_features: ["study_templates","determine_first_data_request_size_using_visible_range","seconds_resolution","custom_resolutions","header_in_fullscreen_mode","legend_last_day_change","hide_right_toolbar","hide_right_toolbar_tabs"],
+      });
+      // Kept private like the real app; exposed under a test-only name for the checks.
+      Object.defineProperty(window, '__testWidget', { value: w });
+      w.headerReady().then(() => {
+        for (const k of [37, 38, 39, 40]) {
+          w.onShortcut(['shift', k], () => document.dispatchEvent(new KeyboardEvent('keydown', { key: ['ArrowLeft', 'ArrowUp', 'ArrowRight', 'ArrowDown'][k - 37], shiftKey: true })));
+        }
+      });
+    });
+  </script>
+</body>
+</html>

@@ -8,7 +8,9 @@
   'use strict';
   if (window.top !== window) return;
 
-  const KEY = 'blindReplaySettings';
+  // Settings are kept per site: tv.dhan.co and scalper.dhan.co have different
+  // layouts, and "start blind on load" must never carry over to another site.
+  const KEY = location.hostname === 'tv.dhan.co' ? 'blindReplaySettings' : 'blindReplaySettings:' + location.hostname;
   let alive = true;
 
   function toPage(msg) {

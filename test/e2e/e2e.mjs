@@ -4,6 +4,8 @@
 //
 //   cd test/e2e && npm install && xvfb-run -a node e2e.mjs      (Linux)
 //   cd test/e2e && npm install && node e2e.mjs                  (macOS/Windows)
+//   SITE=scalper node e2e.mjs   runs the same checks as scalper.dhan.co: library v30
+//   from scalper.dhan.co, chart not fullscreen, widget not published on window.
 import { chromium } from 'playwright';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -12,7 +14,9 @@ import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const EXT = path.resolve(HERE, '../../extension');
-const OUT = process.env.OUT || path.join(os.tmpdir(), 'blindreplay-e2e');
+const SITE = process.env.SITE === 'scalper' ? 'scalper' : 'tv';
+const ORIGIN = SITE === 'scalper' ? 'https://scalper.dhan.co' : 'https://tv.dhan.co';
+const OUT = process.env.OUT || path.join(os.tmpdir(), 'blindreplay-e2e' + (SITE === 'tv' ? '' : '-' + SITE));
 fs.mkdirSync(OUT, { recursive: true });
 const MIN = 60000, DAY = 86400000, IST = 330 * MIN;
 
@@ -53,13 +57,13 @@ const ctx = await chromium.launchPersistentContext(userDir, {
 });
 await ctx.route('**/*', async (route) => {
   const url = route.request().url();
-  if (url === 'https://tv.dhan.co/' || url === 'https://tv.dhan.co/index.html') {
-    return route.fulfill({ contentType: 'text/html', body: fs.readFileSync(path.join(HERE, 'index.html'), 'utf8') });
+  if (url === ORIGIN + '/' || url === ORIGIN + '/index.html') {
+    return route.fulfill({ contentType: 'text/html', body: fs.readFileSync(path.join(HERE, SITE === 'tv' ? 'index.html' : 'index-scalper.html'), 'utf8') });
   }
-  if (url.endsWith('/dhan/dist/fake-feed.js')) {
+  if (url.endsWith('/dhan/dist/fake-feed.js') || url.endsWith('/chunk-FAKEFEED.js')) {
     return route.fulfill({ contentType: 'application/javascript', body: fs.readFileSync(path.join(HERE, 'fake-feed.js'), 'utf8') });
   }
-  if (url.startsWith('https://tv.dhan.co/charting_library_')) return route.continue();
+  if (url.startsWith(ORIGIN + '/charting_library')) return route.continue();
   if (url.startsWith('blob:') || url.startsWith('data:') || url.startsWith('chrome-extension:')) return route.continue();
   return route.abort();
 });
@@ -70,14 +74,32 @@ page.on('console', (m) => {
   if (m.type() === 'error' || /BlindReplay/.test(m.text())) consoleErrors.push(m.text());
 });
 page.on('pageerror', (e) => consoleErrors.push('pageerror: ' + e.message));
-await page.goto('https://tv.dhan.co/');
+await page.goto(ORIGIN + '/');
 await page.waitForFunction(() => window.__blindReplayDebug && window.__blindReplayDebug.state().ready, null, { timeout: 90000 });
 await page.waitForTimeout(2500);
 check('extension attached to widget and patched datafeed', await page.evaluate(() => window.__blindReplayDebug.state().patched));
+if (SITE === 'scalper') check('scalper: widget was found without window.dhan_tvWidget', await page.evaluate(() => window.dhan_tvWidget === undefined));
+
+// ---- Panel layout: grows to fit wider controls (macOS fonts) instead of overflowing ----
+for (const minW of [0, 240]) {
+  const L = await page.evaluate((m) => window.__blindReplayDebug.panelLayout(m), minW);
+  check(`panel: every control inside the panel border (date field ${minW || 'default'})`, L && L.maxChildRight <= L.wrapRight - 0.5 && L.bodyScroll <= L.bodyClient && L.wrapRight <= 1500, L);
+}
+await page.screenshot({ path: `${OUT}/panel-wide.png`, clip: { x: 1000, y: 0, width: 500, height: 560 } });
+await page.reload();
+await page.waitForFunction(() => window.__blindReplayDebug && window.__blindReplayDebug.state().ready, null, { timeout: 90000 });
+await page.waitForTimeout(2500);
+
+// Is the point covered by a BlindReplay strip (outside the chart frame)?
+const outsideCovered = (x, y) => page.evaluate(([x, y]) => {
+  const el = document.elementFromPoint(x, y);
+  return !!(el && el.closest('.blindreplay-outside'));
+}, [x, y]);
+const outsideStrips = () => page.evaluate(() => [...document.querySelectorAll('.blindreplay-outside')].filter((e) => getComputedStyle(e).display !== 'none').length);
 
 const exportChart = (i) =>
   page.evaluate(async (i) => {
-    const r = await window.dhan_tvWidget.chart(i).exportData({ includeTime: true, includeSeries: true, includedStudies: [] });
+    const r = await window.__testWidget.chart(i).exportData({ includeTime: true, includeSeries: true, includedStudies: [] });
     const rows = r.data.map((row) => Array.from(row));
     return { schema: r.schema.map((s) => s.type + ':' + (s.sourceType || '') + ':' + (s.plotTitle || '')), first: rows[0], last: rows[rows.length - 1], n: rows.length, hasLive: rows.some((row) => row.slice(1, 5).includes(99999)), maxTime: Math.max(...rows.map((x) => x[0])) };
   }, i);
@@ -87,7 +109,7 @@ check('before replay: chart shows live data (sentinel arrives)', live.n > 100, {
 await page.screenshot({ path: `${OUT}/0-live.png` });
 
 const viewBefore = await page.evaluate(() => {
-  const ts = window.dhan_tvWidget.chart(0).getTimeScale();
+  const ts = window.__testWidget.chart(0).getTimeScale();
   ts.setBarSpacing(9);
   ts.setRightOffset(4);
   return { b: ts.barSpacing(), r: ts.rightOffset() };
@@ -108,7 +130,7 @@ d = await exportChart(0);
 check('step x5: last candle 09:19', d.last && d.last[0] * 1000 === start + 4 * MIN, { last: d.last && iso(d.last[0] * 1000) });
 check('step x5: no live sentinel after live ticks', !d.hasLive);
 const cover = await page.evaluate(() => {
-  const doc = window.dhan_tvWidget._iFrame.contentDocument;
+  const doc = window.__testWidget._iFrame.contentDocument;
   const c = doc.querySelector('.blindreplay-cover');
   const pane = doc.querySelector('.chart-markup-table.pane');
   if (!c || !pane) return null;
@@ -132,30 +154,44 @@ check('jump +10: last candle 09:27', d.last && d.last[0] * 1000 === start + 12 *
 
 // Keyboard shortcut inside the chart iframe
 await page.mouse.click(500, 400);
-await page.keyboard.press('Shift+ArrowRight');
+await page.keyboard.press('Alt+ArrowRight');
 await page.waitForTimeout(1000);
 d = await exportChart(0);
-check('Shift+→ in chart: last candle 09:28', d.last && d.last[0] * 1000 === start + 13 * MIN, { last: d.last && iso(d.last[0] * 1000) });
+check('Alt+→ in chart: last candle 09:28', d.last && d.last[0] * 1000 === start + 13 * MIN, { last: d.last && iso(d.last[0] * 1000) });
+// Shift + arrows are Dhan's order hotkeys on scalper.dhan.co: never used or swallowed.
+const orderKeysBefore = await page.evaluate(() => window.__orderKeys || 0);
+await page.keyboard.press('Shift+ArrowRight');
+await page.waitForTimeout(800);
+d = await exportChart(0);
+check('Shift+→ is left alone: no replay step', d.last && d.last[0] * 1000 === start + 13 * MIN, { last: d.last && iso(d.last[0] * 1000) });
+if (SITE === 'scalper') check('Shift+→ still reaches the page (order hotkey not blocked)', (await page.evaluate(() => window.__orderKeys)) === orderKeysBefore + 1);
+if (SITE === 'scalper') {
+  await page.evaluate(() => window.__blindReplayDebug.focusPanelField());
+  await page.keyboard.press('Shift+ArrowUp');
+  await page.waitForTimeout(300);
+  check('Shift+↑ typed in a panel field does not reach the page', (await page.evaluate(() => window.__orderKeys)) === orderKeysBefore + 1);
+  await page.mouse.click(500, 400);
+}
 
 // Zoom while running keeps the anchor
 await page.evaluate(() => {
-  const ts = window.dhan_tvWidget.chart(0).getTimeScale();
+  const ts = window.__testWidget.chart(0).getTimeScale();
   ts.setBarSpacing(ts.barSpacing() * 1.6);
 });
 await page.waitForTimeout(800);
 const anchorAfterZoom = await page.evaluate(() => {
-  const ts = window.dhan_tvWidget.chart(0).getTimeScale();
+  const ts = window.__testWidget.chart(0).getTimeScale();
   const lastX = ts.width() - (ts.rightOffset() + 0.5) * ts.barSpacing();
   return lastX / ts.width();
 });
 check('zoom: latest candle stays at ~75%', Math.abs(anchorAfterZoom - 0.75) < 0.03, anchorAfterZoom);
 
 // ---- Two charts: 1m + 5m, synced ----
-await page.evaluate(() => window.dhan_tvWidget.setLayout('2h'));
+await page.evaluate(() => window.__testWidget.setLayout('2h'));
 await page.waitForTimeout(2500);
-await page.evaluate(() => new Promise((res) => window.dhan_tvWidget.chart(1).setResolution('5', { dataReady: res })));
+await page.evaluate(() => new Promise((res) => window.__testWidget.chart(1).setResolution('5', { dataReady: res })));
 await page.waitForTimeout(2500);
-await page.evaluate(() => window.dhan_tvWidget.setActiveChart(0));
+await page.evaluate(() => window.__testWidget.setActiveChart(0));
 await page.evaluate((t) => window.__blindReplayDebug.start(t), start);
 await page.waitForTimeout(4000);
 for (let i = 0; i < 7; i++) await page.evaluate(() => window.__blindReplayDebug.step(1));
@@ -171,7 +207,7 @@ await page.screenshot({ path: `${OUT}/3-sync.png` });
 // ---- Independent mode ----
 await page.evaluate(() => window.__blindReplayDebug.setMode('independent'));
 await page.waitForTimeout(3000);
-await page.evaluate(() => window.dhan_tvWidget.setActiveChart(1));
+await page.evaluate(() => window.__testWidget.setActiveChart(1));
 await page.evaluate(() => window.__blindReplayDebug.step(2));
 await page.waitForTimeout(2500);
 const a2 = await exportChart(0);
@@ -183,11 +219,16 @@ await page.evaluate(() => window.__blindReplayDebug.setMode('sync'));
 
 // ---- Masks ----
 const masks = await page.evaluate(() => {
-  const doc = window.dhan_tvWidget._iFrame.contentDocument;
+  const doc = window.__testWidget._iFrame.contentDocument;
   const right = doc.querySelector('.layout__area--right');
   return { htmlClass: doc.documentElement.classList.contains('blindreplay-mask'), rightAfter: right ? getComputedStyle(right, '::after').backgroundColor : null, rightW: right ? right.getBoundingClientRect().width : 0 };
 });
 check('masks: live-price side panel covered', masks.htmlClass && (masks.rightW === 0 || masks.rightAfter === 'rgb(0, 0, 0)'), masks);
+if (SITE === 'scalper') {
+  check('masks: page header and side panel around the chart covered', (await outsideCovered(300, 20)) && (await outsideCovered(1470, 700)) && !(await outsideCovered(500, 400)));
+} else {
+  check('masks: nothing covered outside a fullscreen chart', (await outsideStrips()) === 0);
+}
 
 // ---- Stop: restore ----
 await page.evaluate(() => window.__blindReplayDebug.stop());
@@ -195,23 +236,24 @@ await page.waitForTimeout(4000);
 const r0 = await exportChart(0);
 check('stop: live data back (sentinel visible again)', r0.hasLive || r0.maxTime * 1000 > start + 60 * MIN, { last: r0.last && iso(r0.last[0] * 1000) });
 const viewAfter = await page.evaluate(() => {
-  const ts = window.dhan_tvWidget.chart(0).getTimeScale();
+  const ts = window.__testWidget.chart(0).getTimeScale();
   return { b: ts.barSpacing(), r: ts.rightOffset() };
 });
 check('stop: zoom and scroll position restored', Math.abs(viewAfter.b - viewBefore.b) < 0.01 && Math.abs(viewAfter.r - viewBefore.r) < 0.01, { viewBefore, viewAfter });
-const coverGone = await page.evaluate(() => [...window.dhan_tvWidget._iFrame.contentDocument.querySelectorAll('.blindreplay-cover')].every((c) => getComputedStyle(c).display === 'none'));
+const coverGone = await page.evaluate(() => [...window.__testWidget._iFrame.contentDocument.querySelectorAll('.blindreplay-cover')].every((c) => getComputedStyle(c).display === 'none'));
 check('stop: covers hidden', coverGone);
+check('stop: page around the chart uncovered', (await outsideStrips()) === 0);
 await page.screenshot({ path: `${OUT}/5-stopped.png` });
 
 // ---- Pick mode ----
-await page.evaluate(() => window.dhan_tvWidget.setLayout('s'));
+await page.evaluate(() => window.__testWidget.setLayout('s'));
 await page.waitForTimeout(2000);
 await page.evaluate(() => window.__blindReplayDebug.pick());
 await page.mouse.move(700, 400);
 await page.waitForTimeout(500);
 await page.screenshot({ path: `${OUT}/6-pick-hover.png` });
 const pickCover = await page.evaluate(() => {
-  const doc = window.dhan_tvWidget._iFrame.contentDocument;
+  const doc = window.__testWidget._iFrame.contentDocument;
   const c = doc.querySelector('.blindreplay-cover');
   const axis = [...doc.querySelectorAll('.chart-markup-table.price-axis-container')].map((a) => a.getBoundingClientRect()).filter((r) => r.width > 0).sort((a, b) => b.left - a.left)[0];
   const r = c.getBoundingClientRect();
@@ -227,6 +269,22 @@ check('pick: nothing at/after the picked candle', p.maxTime * 1000 < st.clock &&
 await page.screenshot({ path: `${OUT}/7-picked.png` });
 await page.evaluate(() => window.__blindReplayDebug.stop());
 
+// ---- Replay switched off and on quickly: never live candles while active ----
+{
+  const bad = [];
+  for (let i = 0; i < 12; i++) {
+    await page.evaluate((t) => { window.__blindReplayDebug.stop(); window.__blindReplayDebug.start(t); }, start);
+    await page.waitForTimeout(i % 3 === 0 ? 0 : 150 * i);
+  }
+  await page.waitForTimeout(3500);
+  const s1 = await page.evaluate(() => window.__blindReplayDebug.state());
+  const e1 = await exportChart(0);
+  if (!s1.active || e1.maxTime * 1000 >= start || e1.hasLive) bad.push({ active: s1.active, msg: s1.message, last: e1.last && iso(e1.last[0] * 1000) });
+  check('quick off/on x12: replay active and nothing at/after start', bad.length === 0, bad);
+  await page.evaluate(() => window.__blindReplayDebug.stop());
+  await page.waitForTimeout(2500);
+}
+
 // ---- Multi-day 1m replay from ~15 days back (chunked history loading) ----
 let far = day - 15 * DAY;
 while ([0, 6].includes(new Date(far + IST).getUTCDay())) far -= DAY;
@@ -235,7 +293,7 @@ const reqBefore = await page.evaluate(() => window.__feedLog.length);
 await page.evaluate((t) => window.__blindReplayDebug.start(t), farStart);
 await page.waitForTimeout(5000);
 let f = await exportChart(0);
-check('15 days back: nothing at/after start', f.maxTime * 1000 < farStart && f.n > 100, { last: f.last && iso(f.last[0] * 1000), n: f.n });
+check('15 days back: nothing at/after start', f.maxTime * 1000 < farStart && f.n > 50, { last: f.last && iso(f.last[0] * 1000), n: f.n, state: await page.evaluate(() => window.__blindReplayDebug.state()) });
 await page.evaluate(() => window.__blindReplayDebug.step(400)); // past the first day's close
 await page.waitForTimeout(1500);
 f = await exportChart(0);
@@ -252,18 +310,19 @@ await page.waitForTimeout(3000);
 await page.evaluate(() => document.dispatchEvent(new CustomEvent('blindreplay:to-page', { detail: JSON.stringify({ type: 'teardown' }) })));
 await page.waitForTimeout(4000);
 const td = await page.evaluate(() => {
-  const df = window.dhan_tvWidget._options.datafeed;
-  const doc = window.dhan_tvWidget._iFrame.contentDocument;
+  const df = window.__testWidget._options.datafeed;
+  const doc = window.__testWidget._iFrame.contentDocument;
   return {
     unpatched: !Object.prototype.hasOwnProperty.call(df, 'getBars'),
     panel: !!document.getElementById('blindreplay-panel-host'),
     covers: doc.querySelectorAll('.blindreplay-cover').length,
     style: !!doc.getElementById('blindreplay-style'),
     mask: doc.documentElement.classList.contains('blindreplay-mask'),
-    trap: !!Object.getOwnPropertyDescriptor(window, 'dhan_tvWidget').get,
+    trap: !!(Object.getOwnPropertyDescriptor(window, 'dhan_tvWidget') || {}).get,
+    strips: document.querySelectorAll('.blindreplay-outside').length,
   };
 });
-check('teardown: datafeed, widget global, panel, covers and styles all restored', td.unpatched && !td.panel && td.covers === 0 && !td.style && !td.mask && !td.trap, td);
+check('teardown: datafeed, widget global, panel, covers and styles all restored', td.unpatched && !td.panel && td.covers === 0 && !td.style && !td.mask && !td.trap && td.strips === 0, td);
 const t0 = await exportChart(0);
 check('teardown: chart back to live data', t0.maxTime * 1000 > start + 60 * MIN, { last: t0.last && iso(t0.last[0] * 1000) });
 

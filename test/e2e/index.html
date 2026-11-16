@@ -11,7 +11,7 @@
   <div id="tv_chart_container"></div>
   <script>
     window.addEventListener('DOMContentLoaded', function () {
-      window.dhan_tvWidget = new TradingView.widget({
+      window.dhan_tvWidget = window.__testWidget = new TradingView.widget({
         fullscreen: true,
         symbol: 'NSE:TEST',
         interval: '1',
